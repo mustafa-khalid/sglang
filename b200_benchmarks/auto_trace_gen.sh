@@ -5,16 +5,16 @@ set -e  # Exit on error
 # Configuration & Arguments
 # ============================================================================
 # Model configuration
-MODEL_NAME="${MODEL_NAME:-deepseek-ai/deepseek-coder-1.3b-instruct}"
-TP_SIZE="${TP_SIZE:-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-0528}"
+TP_SIZE="${TP_SIZE:-8}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
 TEST_SPECS="${TEST_SPECS:-1024,128,4,100 512,256,8,100 1024,512,16,100}"
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
 # Server configuration
 HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
-GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.85}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"
 # Output configuration
 RESULT_DIR="${RESULT_DIR:-${HOME}/logs_sglang}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -115,11 +115,12 @@ docker run -d \
     --enable-metrics \
     --mem-fraction-static $GPU_MEMORY_UTIL \
     --max-total-tokens $MAX_MODEL_LEN \
-    --chunked-prefill-size 8192 \
-    --max-running-requests 64 \
-    --cuda-graph-max-bs 64 \
+    --chunked-prefill-size 131072 \
+    --quantization fp8 \
+    --max-running-requests 128 \
+    --cuda-graph-max-bs 128 \
     --disable-radix-cache \
-    --attention-backend flashinfer \
+    
 
 # Stream logs to file
 : > "$SERVER_LOG"; : > "$STATUS_LOG"
