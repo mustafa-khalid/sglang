@@ -90,8 +90,7 @@ docker rm -f "$CONTAINER_NAME"
 export SGL_ENABLE_JIT_DEEPGEMM=false
 export SGLANG_ENABLE_FLASHINFER_GEMM=true
 
-
-
+# 1. Start container with sleep to keep it running
 docker run -d \
   --gpus=all \
   --name $CONTAINER_NAME \
@@ -106,7 +105,6 @@ docker run -d \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/root/.cache/huggingface \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 \
   -e SGLANG_TORCH_PROFILER_DIR=/workspace/profiles_sglang \
   -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
@@ -115,31 +113,55 @@ docker run -d \
   -v "${TRACES_DIR}:/workspace/profiles_sglang" \
   -w /workspace \
   $DOCKER_IMAGE \
-  python3 -m sglang.launch_server \
-    --model-path $MODEL_NAME \
-    --host 0.0.0.0 \
-    --port $PORT \
-    --tp-size $TP_SIZE \
-    --trust-remote-code \
-    --enable-metrics \
-    --data-parallel-size=1 \
-    --mem-fraction-static $GPU_MEMORY_UTIL \
-    --max-total-tokens $MAX_MODEL_LEN \
-    --chunked-prefill-size 32768 \
-    --max-prefill-tokens 32768 \
-    --enable-flashinfer-allreduce-fusion \
-    --attention-backend trtllm_mla \
-    --quantization fp8 \
-    --moe-runner-backend triton \
-    --max-running-requests 128 \
-    --kv-cache-dtype fp8_e4m3 \
-    --cuda-graph-max-bs 128 \
-    --enable-torch-compile \
-    --disable-radix-cache \
-    --disable-custom-all-reduce
+  sleep infinity
 
-    #--quantization fp8 \
-    
+# 2. Run DeepGEMM compile 
+docker exec $CONTAINER_NAME python3 -m sglang.compile_deep_gemm \
+  --model-path $MODEL_NAME \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --tp-size $TP_SIZE \
+  --trust-remote-code \
+  --enable-metrics \
+  --data-parallel-size=1 \
+  --mem-fraction-static $GPU_MEMORY_UTIL \
+  --max-total-tokens $MAX_MODEL_LEN \
+  --chunked-prefill-size 32768 \
+  --max-prefill-tokens 32768 \
+  --enable-flashinfer-allreduce-fusion \
+  --attention-backend trtllm_mla \
+  --quantization fp8 \
+  --moe-runner-backend triton \
+  --max-running-requests 128 \
+  --kv-cache-dtype auto \
+  --cuda-graph-max-bs 128 \
+  --enable-torch-compile \
+  --disable-radix-cache \
+  --disable-custom-all-reduce
+# 3. Launch server 
+docker exec $CONTAINER_NAME python3 -m sglang.launch_server \
+  --model-path $MODEL_NAME \
+  --host 0.0.0.0 \
+  --port $PORT \
+  --tp-size $TP_SIZE \
+  --trust-remote-code \
+  --enable-metrics \
+  --data-parallel-size=1 \
+  --mem-fraction-static $GPU_MEMORY_UTIL \
+  --max-total-tokens $MAX_MODEL_LEN \
+  --chunked-prefill-size 32768 \
+  --max-prefill-tokens 32768 \
+  --enable-flashinfer-allreduce-fusion \
+  --attention-backend trtllm_mla \
+  --quantization fp8 \
+  --moe-runner-backend triton \
+  --max-running-requests 128 \
+  --kv-cache-dtype auto \
+  --cuda-graph-max-bs 128 \
+  --enable-torch-compile \
+  --disable-radix-cache \
+  --disable-custom-all-reduce
+
 
 # Stream logs to file
 : > "$SERVER_LOG"; : > "$STATUS_LOG"
