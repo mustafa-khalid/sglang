@@ -14,7 +14,7 @@ BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
 # Server configuration
 HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
-GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.90}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.82}"
 # Output configuration
 RESULT_DIR="${RESULT_DIR:-${HOME}/logs_sglang}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -22,7 +22,7 @@ OUTPUT_DIR="${RESULT_DIR}/${TIMESTAMP}"
 TRACES_DIR="${OUTPUT_DIR}/traces_sglang"
 BENCHMARK_DIR="${OUTPUT_DIR}/benchmarks_sglang"
 # Docker configuration
-DOCKER_IMAGE="${DOCKER_IMAGE:-lmsysorg/sglang:latest}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-lmsysorg/sglang:v0.5.5.post3}"
 CONTAINER_NAME="${CONTAINER_NAME:-mkhalidm_sglang}"
 HUGGINGFACE_CACHE="${HUGGINGFACE_CACHE:-/data/huggingface-cache}"
 # Sanity check configuration
@@ -34,7 +34,7 @@ STREAM_LOGS="${STREAM_LOGS:-1}"
 TRACE="${TRACE:-0}"
 #Profiling
 #https://rocm.blogs.amd.com/software-tools-optimization/kernel-analysis-deep/README.html
-export SGLANG_TORCH_PROFILER_DIR=/workspace/profile/
+export SGLANG_TORCH_PROFILER_DIR=/workspace/profiles_sglang/
 
 [[ "$TRACE" == "1" ]] && set -x
 # ============================================================================
@@ -84,6 +84,26 @@ trap cleanup EXIT
 # ============================================================================
 echo "Starting SGLang server with model: $MODEL_NAME"
 docker rm -f "$CONTAINER_NAME" 
+
+
+
+export SGL_ENABLE_JIT_DEEPGEMM=false
+export SGLANG_ENABLE_FLASHINFER_GEMM=true
+
+
+docker run --rm \
+  --gpus=all \
+  --ipc=host \
+  -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
+  -e HF_HOME=/root/.cache/huggingface \
+  -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
+  $DOCKER_IMAGE \
+  python3 -m sglang.compile_deep_gemm \
+    --model-path $MODEL_NAME \
+    --tp-size $TP_SIZE \
+    --trust-remote-code \
+    --quantization fp8
+
 docker run -d \
   --gpus=all \
   --name $CONTAINER_NAME \
@@ -98,12 +118,13 @@ docker run -d \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/root/.cache/huggingface \
-  -e SGLANG_TORCH_PROFILER_DIR=/workspace/profile \
-  -e HSA_NO_SCRATCH_RECLAIM=1 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 \
+  -e SGLANG_TORCH_PROFILER_DIR=/workspace/profiles_sglang \
   -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
   -v "${HOME}:/workspace" \
-  -v "${BENCHMARK_DIR}:/workspace/benchmarks" \
-  -v "${TRACES_DIR}:/workspace/profile" \
+  -v "${BENCHMARK_DIR}:/workspace/benchmarks_sglang" \
+  -v "${TRACES_DIR}:/workspace/profiles_sglang" \
   -w /workspace \
   $DOCKER_IMAGE \
   python3 -m sglang.launch_server \
@@ -113,13 +134,21 @@ docker run -d \
     --tp-size $TP_SIZE \
     --trust-remote-code \
     --enable-metrics \
+    --data-parallel-size=1 \
     --mem-fraction-static $GPU_MEMORY_UTIL \
     --max-total-tokens $MAX_MODEL_LEN \
-    --chunked-prefill-size 131072 \
+    --chunked-prefill-size 32768 \
+    --max-prefill-tokens 32768 \
+    --enable-flashinfer-allreduce-fusion \
+    --attention-backend trtllm_mla \
     --quantization fp8 \
+    --moe-runner-backend flashinfer_trtllm \
     --max-running-requests 128 \
+    --kv-cache-dtype fp8_e4m3 \
     --cuda-graph-max-bs 128 \
     --disable-radix-cache \
+
+    #--quantization fp8 \
     
 
 # Stream logs to file
@@ -257,7 +286,7 @@ for spec in $TEST_SPECS; do
         --request-rate inf \
         --max-concurrency $conc \
         --profile \
-        --output-file "/workspace/benchmarks/${RESULT_JSON}" \
+        --output-file "/workspace/benchmarks_sglang/${RESULT_JSON}" \
         2>&1 | tee "$BENCH_STDOUT_LOG"
     bench_rc=${PIPESTATUS[0]}
     set -e
