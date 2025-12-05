@@ -10,7 +10,7 @@ TP_SIZE="${TP_SIZE:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
 TEST_SPECS="${TEST_SPECS:-1024,128,4,100 512,256,8,100 1024,512,16,100}"
-BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
+BENCH_TIMEOUT="${BENCH_TIMEOUT:-36000}"
 # Server configuration
 HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
@@ -91,18 +91,6 @@ export SGL_ENABLE_JIT_DEEPGEMM=false
 export SGLANG_ENABLE_FLASHINFER_GEMM=true
 
 
-docker run --rm \
-  --gpus=all \
-  --ipc=host \
-  -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
-  -e HF_HOME=/root/.cache/huggingface \
-  -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
-  $DOCKER_IMAGE \
-  python3 -m sglang.compile_deep_gemm \
-    --model-path $MODEL_NAME \
-    --tp-size $TP_SIZE \
-    --trust-remote-code \
-    --quantization fp8
 
 docker run -d \
   --gpus=all \
@@ -142,11 +130,13 @@ docker run -d \
     --enable-flashinfer-allreduce-fusion \
     --attention-backend trtllm_mla \
     --quantization fp8 \
-    --moe-runner-backend flashinfer_trtllm \
+    --moe-runner-backend triton \
     --max-running-requests 128 \
     --kv-cache-dtype fp8_e4m3 \
     --cuda-graph-max-bs 128 \
+    --enable-torch-compile \
     --disable-radix-cache \
+    --disable-custom-all-reduce
 
     #--quantization fp8 \
     
