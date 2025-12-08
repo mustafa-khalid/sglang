@@ -121,7 +121,6 @@ docker run -d \
     --tp-size $TP_SIZE \
     --trust-remote-code \
     --enable-metrics \
-    --data-parallel-size=1 \
     --mem-fraction-static $GPU_MEMORY_UTIL \
     --max-total-tokens $MAX_MODEL_LEN \
     --chunked-prefill-size 32768 \
@@ -186,7 +185,7 @@ if [[ "$state" != "running" ]]; then
     exit 1
 fi
 # Wait for server to be ready
-deadline=$((SECONDS+1200))
+deadline=$((SECONDS+1200000))
 echo "Waiting for server health at http://${HOST}:${PORT}/health ..."
 until code="$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}:${PORT}/health" || true)"; [[ "$code" == "200" ]]; do
     state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo 'missing')"
@@ -242,10 +241,12 @@ echo "Starting benchmarking..."
 SCENARIO_ID=0
 # Parse test specs: "input_len,output_len,concurrency,num_prompts"
 for spec in $TEST_SPECS; do
-    IFS=',' read -r input_len output_len conc num_prompts <<< "$spec"
+     IFS=',' read -r input_len output_len conc num_prompts <<< "$spec"
     
     SCENARIO_ID=$((SCENARIO_ID+1))
     SCENARIO_NAME="isl${input_len}_osl${output_len}_c${conc}_np${num_prompts}"
+    SCENARIO_TRACES_DIR="${TRACES_DIR}/${SCENARIO_NAME}"
+    mkdir -p "$SCENARIO_TRACES_DIR"
     
     echo ""
     echo "=========================================="
@@ -256,6 +257,8 @@ for spec in $TEST_SPECS; do
     echo "  Num Prompts: $num_prompts"
     echo "=========================================="
     
+    RESULT_JSON="${SCENARIO_NAME}_${STAMP}.json"
+    BENCH_STDOUT_LOG="${SCENARIO_TRACES_DIR}/${SCENARIO_NAME}.bench.log"
     
     # Warmup 
     echo -e "\n[INFO] Starting warmup..." 
@@ -272,17 +275,15 @@ for spec in $TEST_SPECS; do
         --num-prompts $conc \
         --request-rate inf \
         --max-concurrency $conc \
-        2>&1 | tee "$BENCH_STDOUT_LOG"
+        2>&1 | tee "$BENCH_STDOUT_LOG.warmup"
     bench_rc=${PIPESTATUS[0]}
     set -e
     
-    
-    RESULT_JSON="${SCENARIO_NAME}_${STAMP}.json"
-    BENCH_STDOUT_LOG="${TRACES_DIR}/${SCENARIO_NAME}.bench.log"
+    # Clear any existing traces before this run
+    docker exec $CONTAINER_NAME rm -rf /workspace/profiles_sglang/*.json 2>/dev/null || true
     
     # Main benchmark
     echo -e "\n[INFO] Starting main benchmark..."
-    #docker exec $CONTAINER_NAME curl http://localhost:$PORT/start_profile
     set +e
     docker exec $CONTAINER_NAME \
         python3 -m sglang.bench_serving \
@@ -301,8 +302,11 @@ for spec in $TEST_SPECS; do
         2>&1 | tee "$BENCH_STDOUT_LOG"
     bench_rc=${PIPESTATUS[0]}
     set -e
-    #docker exec $CONTAINER_NAME curl http://localhost:$PORT/stop_profile
     
+    # Move traces to scenario-specific directory
+    sudo mv "${TRACES_DIR}"/*.json "$SCENARIO_TRACES_DIR/" 2>/dev/null || true
+    
+    echo "[INFO] Traces saved to: $SCENARIO_TRACES_DIR"
     echo "Benchmark exit code: ${bench_rc}" | tee -a "$STATUS_LOG"
     
     if [ $bench_rc -eq 0 ]; then
