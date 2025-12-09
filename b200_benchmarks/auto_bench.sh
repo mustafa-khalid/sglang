@@ -9,7 +9,7 @@ TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
-TEST_SPECS="${TEST_SPECS:-1024,128,4,100 512,256,8,100 1024,512,16,100}"
+TEST_SPECS="${TEST_SPECS:-1024,1024,8,64 1024,1024,32,128 1024,1024,128,384}"
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-36000}"
 # Server configuration
 HOST="${HOST:-localhost}"
