@@ -8,7 +8,7 @@ MODEL_NAME="${MODEL_NAME:-deepseek-ai/deepseek-coder-6.7b-instruct}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
-TEST_SPECS="${TEST_SPECS:-512,128,4,50 256,256,8,50}"
+TEST_SPECS="${TEST_SPECS:-128,128,8,8 128,128,32,32 256,256,8,8 256,256,32,32}"
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
 # Server configuration
 HOST="${HOST:-localhost}"
