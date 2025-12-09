@@ -7,6 +7,7 @@ set -e  # Exit on error
 # Model configuration
 MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-R1-0528}"
 TP_SIZE="${TP_SIZE:-8}"
+DP_SIZE="${DP_SIZE:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
 TEST_SPECS="${TEST_SPECS:-1024,128,4,100 512,256,8,100 1024,512,16,100}"
@@ -14,7 +15,7 @@ BENCH_TIMEOUT="${BENCH_TIMEOUT:-36000}"
 # Server configuration
 HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
-GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.82}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.89}"
 # Output configuration
 RESULT_DIR="${RESULT_DIR:-${HOME}/logs_sglang}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -83,12 +84,7 @@ trap cleanup EXIT
 # Start SGLang Server
 # ============================================================================
 echo "Starting SGLang server with model: $MODEL_NAME"
-docker rm -f "$CONTAINER_NAME" 
-
-
-
-export SGL_ENABLE_JIT_DEEPGEMM=false
-export SGLANG_ENABLE_FLASHINFER_GEMM=true
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 
 docker run -d \
@@ -99,13 +95,14 @@ docker run -d \
   --privileged \
   --security-opt seccomp=unconfined \
   --ulimit core=0:0 \
+  -e SGL_ENABLE_JIT_DEEPGEMM=0 \
+  -e SGLANG_CUTLASS_MOE=1 \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 \
   -e TOKENIZERS_PARALLELISM=true \
   -e TORCH_CUDA_ARCH_LIST="10.0" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/root/.cache/huggingface \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 \
   -e SGLANG_TORCH_PROFILER_DIR=/workspace/profiles_sglang \
   -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
@@ -116,23 +113,22 @@ docker run -d \
   $DOCKER_IMAGE \
   python3 -m sglang.launch_server \
     --model-path $MODEL_NAME \
+    --tokenizer-path $MODEL_NAME \
     --host 0.0.0.0 \
     --port $PORT \
     --tp-size $TP_SIZE \
+    --data-parallel-size $DP_SIZE \
     --trust-remote-code \
     --enable-metrics \
+    --enable-dp-attention \
     --mem-fraction-static $GPU_MEMORY_UTIL \
     --max-total-tokens $MAX_MODEL_LEN \
     --chunked-prefill-size 32768 \
     --max-prefill-tokens 32768 \
-    --enable-flashinfer-allreduce-fusion \
-    --quantization fp8 \
-    --moe-runner-backend triton \
-    --max-running-requests 128 \
-    --kv-cache-dtype auto \
-    --cuda-graph-max-bs 128 \
-    --disable-radix-cache \
-    --disable-custom-all-reduce
+    --max-running-requests 3072 \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend trtllm-mla \
+    --disable-radix-cache
 
 
 #--attention-backend trtllm_mla \
