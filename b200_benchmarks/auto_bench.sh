@@ -99,6 +99,9 @@ docker run -d \
   -e HF_TOKEN -e HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/root/.cache/huggingface \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 \
+  -e NCCL_P2P_DISABLE=0 \
+  -e NCCL_IB_DISABLE=0 \
+  -e CUDA_DEVICE_MAX_CONNECTIONS=1 \
   -v "${HUGGINGFACE_CACHE}/hub:/root/.cache/huggingface/hub" \
   -v "${HOME}:/workspace" \
   -v "${BENCHMARK_DIR}:/workspace/benchmarks_sglang" \
@@ -121,7 +124,8 @@ docker run -d \
     --max-running-requests 3072 \
     --kv-cache-dtype fp8_e4m3 \
     --attention-backend trtllm-mla \
-    --disable-radix-cache
+    --disable-radix-cache \
+    --disable-custom-all-reduce
 
 # Stream logs to file
 : > "$SERVER_LOG"; : > "$STATUS_LOG"
