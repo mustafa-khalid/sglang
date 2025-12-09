@@ -6,6 +6,7 @@ set -e  # Exit on error
 # Model configuration
 MODEL_NAME="${MODEL_NAME:-deepseek-ai/deepseek-coder-6.7b-instruct}"
 TP_SIZE="${TP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 # Benchmarking configuration - format: "input_len,output_len,concurrency,num_prompts"
 TEST_SPECS="${TEST_SPECS:-128,128,8,8 128,128,32,32 256,256,8,8 256,256,32,32}"
@@ -13,7 +14,7 @@ BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
 # Server configuration
 HOST="${HOST:-localhost}"
 PORT="${PORT:-8000}"
-GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.85}"
+GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.89}"
 # Output configuration
 RESULT_DIR="${RESULT_DIR:-${HOME}/logs_sglang}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -38,11 +39,12 @@ TRACE="${TRACE:-0}"
 mkdir -p "$OUTPUT_DIR" "$BENCHMARK_DIR"
 # Save configuration
 cat > "${OUTPUT_DIR}/config.txt" << EOF
-Benchmark Configuration (LITE)
-==============================
+Benchmark Configuration (LITE - Optimized)
+==========================================
 Date: $(date)
 Model: $MODEL_NAME
 Tensor Parallel Size: $TP_SIZE
+Data Parallel Size: $DP_SIZE
 Max Model Length: $MAX_MODEL_LEN
 Test Specs: $TEST_SPECS
 GPU Memory Utilization: $GPU_MEMORY_UTIL
@@ -88,6 +90,8 @@ docker run -d \
   --privileged \
   --security-opt seccomp=unconfined \
   --ulimit core=0:0 \
+  -e SGL_ENABLE_JIT_DEEPGEMM=0 \
+  -e SGLANG_CUTLASS_MOE=1 \
   -e TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 \
   -e TOKENIZERS_PARALLELISM=true \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -104,14 +108,18 @@ docker run -d \
     --host 0.0.0.0 \
     --port $PORT \
     --tp-size $TP_SIZE \
+    --data-parallel-size $DP_SIZE \
     --trust-remote-code \
     --enable-metrics \
+    --enable-dp-attention \
     --mem-fraction-static $GPU_MEMORY_UTIL \
     --max-total-tokens $MAX_MODEL_LEN \
-    --chunked-prefill-size 8192 \
-    --max-prefill-tokens 8192 \
-    --max-running-requests 32 \
-    --cuda-graph-max-bs 32
+    --chunked-prefill-size 32768 \
+    --max-prefill-tokens 32768 \
+    --max-running-requests 3072 \
+    --kv-cache-dtype fp8_e5m2 \
+    --attention-backend flashinfer \
+    --disable-radix-cache
 
 # Stream logs to file
 : > "$SERVER_LOG"; : > "$STATUS_LOG"
@@ -207,10 +215,28 @@ for spec in $TEST_SPECS; do
     echo "  Num Prompts: $num_prompts"
     echo "=========================================="
     
+
+        
+    echo -e "\n[INFO] Running warmup..."
+    set +e
+    docker exec $CONTAINER_NAME \
+        python3 -m sglang.bench_serving \
+        --host $HOST \
+        --port $PORT \
+        --backend sglang \
+        --tokenizer $MODEL_NAME \
+        --dataset-name random \
+        --random-input-len $input_len \
+        --random-output-len $output_len \
+        --num-prompts $num_prompts \
+        --request-rate inf \
+        --max-concurrency $conc 
+    set -e
+
     RESULT_JSON="${SCENARIO_NAME}_${STAMP}.json"
     BENCH_STDOUT_LOG="${BENCHMARK_DIR}/${SCENARIO_NAME}.bench.log"
     
-    # Main benchmark (no warmup, no profiling)
+    # Main benchmark 
     echo -e "\n[INFO] Starting benchmark..."
     set +e
     docker exec $CONTAINER_NAME \
