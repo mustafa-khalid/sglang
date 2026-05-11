@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
 
 # Triton implementation
 @triton.jit
@@ -17,6 +19,7 @@ def _act_quant_kernel(
     round_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
 ):
     """
     Triton kernel for activation quantization.
@@ -27,9 +30,13 @@ def _act_quant_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # FP8 constants
-    fp8_min = -448.0
-    fp8_max = 448.0
+    # FP8 clamp / scale range (match TileLang NSA path: ±224 for fnuz, ±448 for e4m3fn)
+    if IS_FNUZ:
+        fp8_min = -224.0
+        fp8_max = 224.0
+    else:
+        fp8_min = -448.0
+        fp8_max = 448.0
     fp8_max_inv = 1.0 / fp8_max
 
     # Calculate row and column offsets
@@ -95,7 +102,7 @@ def act_quant(
         scale_fmt (Optional[str], optional): The format of the scale. Default is None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - The quantized tensor (`float8_e4m3fn` on CUDA, `float8_e4m3fnuz` on HIP when fnuz FP8 is used).
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
@@ -108,8 +115,11 @@ def act_quant(
     x_flat = x.view(-1, N)
     M = x_flat.size(0)
 
-    # Allocate output tensors
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    _is_fnuz = is_fp8_fnuz()
+    _out_fp8 = (
+        torch.float8_e4m3fnuz if _is_fnuz else torch.float8_e4m3fn
+    )
+    y = torch.empty_like(x, dtype=_out_fp8)
     y_flat = y.view(-1, N)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     s_flat = s.view(-1, N // block_size)
@@ -130,6 +140,7 @@ def act_quant(
         round_scale=round_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_FNUZ=_is_fnuz,
         num_stages=0 if round_scale else 2,
     )
 
