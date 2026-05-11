@@ -72,6 +72,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        # Packed DSv4 KV pages are raw bytes; keep uint8 backing even if logical dtype is FP8 (e.g. fnuz).
+        self.store_dtype = torch.uint8
         self._create_buffers()
 
     def _create_buffers(self):

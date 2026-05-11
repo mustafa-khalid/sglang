@@ -697,8 +697,13 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+        _fp8_dtypes_for_uint8_storage = (torch.float8_e5m2, torch.float8_e4m3fn)
+        _fp8_fnuz = getattr(torch, "float8_e4m3fnuz", None)
+        if _fp8_fnuz is not None:
+            _fp8_dtypes_for_uint8_storage = _fp8_dtypes_for_uint8_storage + (_fp8_fnuz,)
+        if dtype in _fp8_dtypes_for_uint8_storage:
+            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for some FP8 dtypes
+            # (e.g. e5m2). ROCm MI300 uses float8_e4m3fnuz for FP8 KV; packed layouts expect byte storage.
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
