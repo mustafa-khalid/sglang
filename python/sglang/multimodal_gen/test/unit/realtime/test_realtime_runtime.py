@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
+import pytest
 import torch
+from fastapi import FastAPI, WebSocket
+from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -17,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_adapter,
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
@@ -33,31 +37,30 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
+    has_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
     LingBotWorldCausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_diffusion import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
     RealtimeDiffusionStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime_input_validation import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.input_validation import (
     RealtimeInputValidationStage,
     RealtimeInputValidationState,
 )
-from sglang.multimodal_gen.runtime.realtime.causal_state import (
-    RealtimeCausalDecodeState,
-)
-from sglang.multimodal_gen.runtime.realtime.condition_events import (
+from sglang.multimodal_gen.runtime.realtime.control_signals import (
     ControlStateTransition,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
     RealtimeSessionCache,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
+from sglang.multimodal_gen.runtime.realtime.states import (
+    RealtimeCausalDecodeState,
 )
+from sglang.multimodal_gen.runtime.realtime.video import RAW_RGB_CONTENT_TYPE
 
 
 class _Req(SimpleNamespace):
@@ -74,8 +77,14 @@ class _State(BaseRealtimeState):
         self.disposed = True
 
 
+class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
+    def forward(self, batch, component_manager=None):
+        del batch, component_manager
+        raise NotImplementedError
+
+
 def test_realtime_diffusion_stage_declares_long_lived_components():
-    stage = RealtimeDiffusionStage()
+    stage = _TestRealtimeDiffusionStage()
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(dit_precision="bf16", vae_precision="fp32")
     )
@@ -93,7 +102,7 @@ def test_realtime_diffusion_stage_declares_long_lived_components():
 
 
 def test_realtime_diffusion_stage_requires_session():
-    stage = RealtimeDiffusionStage(default_height=480, default_width=832)
+    stage = _TestRealtimeDiffusionStage(default_height=480, default_width=832)
     req = _Req(session=None)
 
     try:
@@ -147,11 +156,11 @@ def test_realtime_session_cache_rejects_missing_nonzero_chunk():
         raise AssertionError("expected missing realtime session to fail")
 
 
-def test_lingbot_realtime_state_uses_generic_condition_queue():
+def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    assert state.sample_camera_actions(3) == [[], [], []]
-    state.receive_camera_actions([["w"], ["a"], ["s"], ["d"]])
+    assert state.sample_camera_actions(3) is None
+    state.receive_camera_action_script([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], [], []]
     assert state.sample_camera_actions(3) == [[], [], []]
@@ -160,6 +169,17 @@ def test_lingbot_realtime_state_uses_generic_condition_queue():
     assert state.has_prompt()
     assert state.sample_prompt() == "turn left"
     assert not state.has_prompt()
+
+
+def test_lingbot_realtime_camera_script_replaces_state_queue():
+    state = lingbot_realtime.LingBotWorldRealtimeState()
+
+    state.receive_camera_state(["w"], event_id=7)
+    state.receive_camera_action_script([["d"]], event_id=8)
+
+    assert state.sample_camera_actions(3) == [["d"], [], []]
+    assert state.latest_sampled_event_id == 8
+    assert state.sample_camera_actions(3) == [[], [], []]
 
 
 def test_lingbot_realtime_camera_events_preserve_short_presses():
@@ -204,7 +224,7 @@ def test_lingbot_realtime_camera_state_compacts_multiple_pending_updates():
 
 def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
     state = sana_wm_realtime.SanaWMRealtimeAdapterState()
-    result = state.receive_camera_event_payload(
+    result = state.receive_camera_control_event_payload(
         {
             "mode": "state",
             "transitions": [
@@ -221,13 +241,13 @@ def test_sana_wm_realtime_camera_state_uses_sana_normalizer():
 
 
 def test_sana_wm_realtime_adapter_preserves_requested_size():
-    async def fake_save_image_to_path(image, target_path):
+    async def fake_save_image_to_path(image, target_path, *, uploads_root):
         return target_path
 
-    old_save_image_to_path = sana_wm_realtime.save_image_to_path
-    old_get_global_server_args = sana_wm_realtime.get_global_server_args
-    sana_wm_realtime.save_image_to_path = fake_save_image_to_path
-    sana_wm_realtime.get_global_server_args = lambda: SimpleNamespace(
+    old_save_image_to_path = realtime_adapter.save_image_to_path
+    old_get_global_server_args = realtime_adapter.get_global_server_args
+    realtime_adapter.save_image_to_path = fake_save_image_to_path
+    realtime_adapter.get_global_server_args = lambda: SimpleNamespace(
         input_save_path=None
     )
     try:
@@ -245,8 +265,8 @@ def test_sana_wm_realtime_adapter_preserves_requested_size():
 
         assert request.size == "832x480"
     finally:
-        sana_wm_realtime.save_image_to_path = old_save_image_to_path
-        sana_wm_realtime.get_global_server_args = old_get_global_server_args
+        realtime_adapter.save_image_to_path = old_save_image_to_path
+        realtime_adapter.get_global_server_args = old_get_global_server_args
 
 
 def test_lingbot_realtime_adapter_ingests_generic_events():
@@ -276,6 +296,104 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     assert state.sample_camera_actions(3) == [["w"], ["d"], []]
     assert state.sample_prompt() == "turn left"
     assert state.latest_sampled_event_id == 8
+
+
+def test_lingbot_realtime_adapter_ingests_composite_input_event():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": [["w"], ["d"]],
+        },
+        event_id=9,
+    )
+
+    event_log = adapter.ingest_event(session, composite_event)
+
+    assert "kind=composite_input" in event_log
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+    assert chunk_inputs.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_CAMERA_ACTIONS_CONDITION
+    ] == [["w"], ["d"], []]
+    assert adapter.get_realtime_event_id(session) == 9
+
+
+def test_lingbot_realtime_adapter_rejects_composite_input_atomically():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": ["w"],
+        },
+        event_id=10,
+    )
+
+    with pytest.raises(ValueError, match="camera_actions"):
+        adapter.ingest_event(session, composite_event)
+
+    state = adapter._state(session)
+    assert not state.has_prompt()
+    assert state.sample_camera_actions(3) is None
+
+
+def test_lingbot_realtime_prompt_event_marks_crossattn_reset():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+    state = adapter._state(session)
+    state.receive_prompt("turn left", event_id=8)
+
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+
+    assert chunk_inputs.prompt == "turn left"
+    assert session.request.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
 
 
 def test_lingbot_realtime_adapter_ingests_state_camera_events():
@@ -345,7 +463,8 @@ def test_generate_session_respects_max_chunks():
     assert session.reached_max_chunks()
 
 
-def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
+@pytest.mark.parametrize("fail_next_chunk", [False, True])
+def test_generate_loop_overlaps_send_with_next_generation(monkeypatch, fail_next_chunk):
     events = []
 
     class _Adapter:
@@ -374,6 +493,8 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     async def fake_process_generation_batch(client, batch):
         del client
         events.append(f"generate_start_{batch.block_idx}")
+        if fail_next_chunk and batch.block_idx == 1:
+            raise RuntimeError("next chunk failed")
         await asyncio.sleep(0.01)
         events.append(f"generate_end_{batch.block_idx}")
         return None, SimpleNamespace()
@@ -401,13 +522,17 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
 
     class _Ws:
         async def send_bytes(self, _message):
-            pass
+            if msgspec.msgpack.decode(_message)["type"] == "error":
+                events.append("error")
 
     asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
 
     assert events.index("generate_start_1") < events.index("send_end_0")
-    assert events.index("send_end_0") < events.index("send_start_1")
-    assert events[-1] == "send_end_1"
+    if fail_next_chunk:
+        assert events.index("send_end_0") < events.index("error")
+    else:
+        assert events.index("send_end_0") < events.index("send_start_1")
+        assert events[-1] == "send_end_1"
 
 
 def test_send_output_emits_chunk_stats_message():
@@ -490,6 +615,80 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
+def test_invalid_event_does_not_split_frame_header_and_payload():
+    """an invalid event under send backpressure must not corrupt frame transport"""
+
+    async def run():
+        header_sent = asyncio.Event()
+        event_read = asyncio.Event()
+        resume_send = asyncio.Event()
+        messages = []
+        incoming = asyncio.Queue()
+        await incoming.put({"type": "websocket.connect"})
+
+        async def receive():
+            message = await incoming.get()
+            if message["type"] == "websocket.receive":
+                event_read.set()
+            return message
+
+        async def send(message):
+            if message["type"] == "websocket.send":
+                messages.append(message["bytes"])
+                if len(messages) == 1:
+                    header_sent.set()
+                    await resume_send.wait()
+
+        ws = WebSocket({"type": "websocket"}, receive, send)
+        await ws.accept()
+        session = GenerateSession()
+        session.set_adapter(sana_wm_realtime.SanaWMRealtimeAdapter())
+        chunk = session.new_chunk()
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id=chunk.request_id,
+            width=256,
+            height=256,
+            enable_upscaling=False,
+            realtime_output_format="raw",
+            realtime_event_id=None,
+            condition_inputs={},
+        )
+        frame = bytes([1, 2, 3]) * (256 * 256)
+        result = OutputBatch(
+            raw_frame_batches=[[frame]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        )
+        output_task = asyncio.create_task(
+            realtime_video_api._send_output_and_log(
+                ws, session, chunk, batch, result, 0.0, 0.0, time.perf_counter()
+            )
+        )
+        listen_task = asyncio.create_task(
+            realtime_video_api._listen_events(ws, session)
+        )
+        await header_sent.wait()
+        await incoming.put(
+            {"type": "websocket.receive", "bytes": msgspec.msgpack.encode([])}
+        )
+        await event_read.wait()
+        await asyncio.sleep(0)
+        resume_send.set()
+        await incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.gather(output_task, listen_task)
+
+        assert msgspec.msgpack.decode(messages[0])["type"] == "frame_batch_header"
+        assert messages[1] == frame
+        assert sorted(
+            msgspec.msgpack.decode(item)["type"] for item in messages[2:]
+        ) == [
+            "chunk_stats",
+            "error",
+        ]
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
 def test_wait_for_active_session_slot_observes_release(monkeypatch):
     async def run():
         realtime_video_api._ACTIVE_SESSION_IDS.clear()
@@ -508,6 +707,65 @@ def test_wait_for_active_session_slot_observes_release(monkeypatch):
             realtime_video_api._ACTIVE_SESSION_IDS.clear()
 
     assert asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid_init", [False, True])
+def test_uninitialized_connections_do_not_reserve_realtime_slot(
+    monkeypatch, invalid_init
+):
+    """idle or invalid connections must not exclude valid sessions from the GPU"""
+    released = []
+
+    class _Adapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def create_state(self):
+            return None
+
+        async def on_init(self, session, request):
+            pass
+
+    async def generate_frames(ws, session):
+        await ws.send_bytes(msgspec.msgpack.encode({"session_id": session.id}))
+        await asyncio.Future()
+
+    async def release(req):
+        released.append(req.session_id)
+
+    monkeypatch.setattr(realtime_video_api, "_ACTIVE_SESSION_IDS", set())
+    monkeypatch.setattr(realtime_video_api, "get_global_server_args", lambda: None)
+    monkeypatch.setattr(
+        realtime_video_api, "get_realtime_model_adapter", lambda _: _Adapter()
+    )
+    monkeypatch.setattr(realtime_video_api, "_generate_loop", generate_frames)
+    monkeypatch.setattr(realtime_video_api.async_scheduler_client, "forward", release)
+    app = FastAPI()
+    app.include_router(realtime_video_api.router)
+    endpoint = "/v1/realtime_video/generate"
+    init = msgspec.msgpack.encode({"type": "init", "prompt": "A quiet village"})
+
+    with TestClient(app) as client, client.websocket_connect(endpoint) as idle:
+        if invalid_init:
+            idle.send_bytes(msgspec.msgpack.encode([]))
+            assert (
+                msgspec.msgpack.decode(idle.receive_bytes())["content"]
+                == "invalid generate request"
+            )
+        with client.websocket_connect(endpoint) as active:
+            active.send_bytes(init)
+            response = msgspec.msgpack.decode(active.receive_bytes())
+            assert "session_id" in response, response
+            session_id = response["session_id"]
+            with client.websocket_connect(endpoint) as rejected:
+                rejected.send_bytes(init)
+                assert (
+                    msgspec.msgpack.decode(rejected.receive_bytes())["content"]
+                    == "another realtime session is already active"
+                )
+                assert rejected.receive()["code"] == 1008
+            assert released == []
+            assert realtime_video_api._ACTIVE_SESSION_IDS == {session_id}
+        assert released == [session_id]
+        assert not realtime_video_api._ACTIVE_SESSION_IDS
+    assert released == [session_id]
 
 
 def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
@@ -530,7 +788,10 @@ def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
             fake_forward,
         )
         try:
-            await realtime_video_api._cleanup_realtime_session(session, None, None)
+            generate_task = asyncio.create_task(asyncio.sleep(0))
+            await realtime_video_api._cleanup_realtime_session(
+                session, generate_task, None
+            )
             still_active_after_cleanup = (
                 session.id in realtime_video_api._ACTIVE_SESSION_IDS
             )
@@ -590,15 +851,16 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
             prompt=sampling_params.prompt,
             condition_inputs=dict(sampling_params.condition_inputs),
             realtime_chunk_size=sampling_params.realtime_chunk_size,
+            session=None,
         )
 
     monkeypatch.setattr(
-        lingbot_realtime,
+        realtime_adapter,
         "build_sampling_params",
         fake_build_sampling_params,
     )
     monkeypatch.setattr(
-        lingbot_realtime,
+        realtime_adapter,
         "prepare_request",
         fake_prepare_backend_request,
     )
@@ -617,7 +879,7 @@ def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):
     assert batch.request_id == chunk.request_id
     assert batch.condition_inputs == {"camera_actions": [["w"], ["w"], ["w"]]}
     assert batch.realtime_chunk_size == 3
-    assert batch.session is session.realtime_session
+    assert batch.session is None
     assert batch.realtime_session_id == session.id
     assert batch.block_idx == 0
     assert batch.return_raw_frames is True
@@ -653,6 +915,7 @@ def test_lingbot_realtime_condition_horizon_repeats_blank_tail_chunk():
     latent_condition = torch.ones(1, latent_channels, latent_frames, 2, 2)
     batch = SimpleNamespace(
         height=2 * spatial_ratio,
+        num_frames=num_frames,
         width=2 * spatial_ratio,
     )
     condition_full = config.postprocess_image_latent(latent_condition, batch)
@@ -743,7 +1006,7 @@ def test_lingbot_realtime_adapter_sends_stale_output_for_client_cutover():
     session = GenerateSession()
     session.set_adapter(adapter)
     state = adapter._state(session)
-    state.receive_camera_actions([["d"]], event_id=7)
+    state.receive_camera_action_script([["d"]], event_id=7)
     calls = []
 
     async def fake_send(ws, session_arg, result_arg, batch_arg):
@@ -857,6 +1120,7 @@ def test_realtime_input_validation_reuses_generator_across_chunks():
 def test_realtime_registry_resolves_lingbot_adapter():
     server_args = SimpleNamespace(pipeline_config=LingBotWorldCausalDMDConfig())
 
+    assert has_realtime_model_adapter(server_args)
     adapter = get_realtime_model_adapter(server_args)
 
     assert isinstance(adapter, lingbot_realtime.LingBotWorldRealtimeAdapter)
@@ -884,14 +1148,12 @@ def test_realtime_chunk_latent_preparation_uses_chunk_spec():
 
     import torch
 
-    from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
         RealtimeChunkLatentPreparationStage,
     )
 
     transformer = SimpleNamespace(
-        config=SimpleNamespace(
-            arch_config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
-        )
+        config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
     )
     stage = RealtimeChunkLatentPreparationStage.__new__(
         RealtimeChunkLatentPreparationStage

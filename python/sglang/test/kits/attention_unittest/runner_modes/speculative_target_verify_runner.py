@@ -2,8 +2,8 @@ from typing import Literal
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPVerifyInput
@@ -259,6 +259,17 @@ def _make_custom_masks(
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
 
+def _expected_case_and_masks_for_spec_verify(
+    case,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind,
+    device: str,
+):
+    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    return case, masks_by_req
+
+
 def _make_retrieve_tensors(
     case,
     *,
@@ -299,6 +310,14 @@ def _make_spec_verify_input(
     if spec_kind == "dflash":
         if topk != 1:
             raise ValueError("DFlash verify is linear and expects topk=1.")
+        if (
+            case.backend == "flashinfer"
+            and getattr(case, "sliding_window_size", None) is not None
+        ):
+            # Production DFLASH disables custom verify masks for FlashInfer
+            # backends. The window read clips the cached prefix; the kernel's
+            # causal window masks each query to its own window.
+            custom_mask = None
         return DFlashVerifyInput(
             draft_token=batch.input_ids,
             positions=batch.positions,
@@ -311,7 +330,7 @@ def _make_spec_verify_input(
     if spec_kind == "ngram":
         return NgramVerifyInput(
             draft_token=batch.input_ids,
-            tree_mask=custom_mask,
+            custom_mask=custom_mask,
             positions=batch.positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
@@ -375,12 +394,18 @@ def _target_verify_expected_output(
     case,
     inputs,
     topk: int,
+    spec_kind: SpecVerifyKind,
     device: str,
 ):
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     return reference_fn(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -434,8 +459,8 @@ def _run_spec_verify_cuda_graph_case(
         make_capture_case=lambda base, name, capture_prefix_len, bs: (
             make_case_with_prefix_lens(base, name, (capture_prefix_len,) * bs)
         ),
-        make_replay_case=lambda base, name, pad_prefix_lens: (
-            make_case_with_prefix_lens(base, name, base.prefix_lens + pad_prefix_lens)
+        make_replay_case=lambda base, name, pad_prefix_lens: make_case_with_prefix_lens(
+            base, name, base.prefix_lens + pad_prefix_lens
         ),
         make_forward_batch=make_forward_batch,
         fixture_inputs=fixture_inputs,
@@ -457,6 +482,7 @@ def _run_spec_verify_cuda_graph_case(
                 case=spec_case,
                 inputs=inputs,
                 topk=topk,
+                spec_kind=spec_kind,
                 device=device,
             )
         ),
@@ -498,7 +524,12 @@ def run_dense_spec_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
@@ -509,7 +540,7 @@ def run_dense_spec_verify_case(
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -675,8 +706,8 @@ def run_gdn_eagle_verify_cuda_graph_case(
         make_forward_batch=_make_gdn_forward_batch,
         fixture_inputs=gdn_fixture_inputs,
         make_capture_inputs=make_gdn_random_inputs,
-        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
-            gdn_fixture_inputs(fixture)
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: gdn_fixture_inputs(
+            fixture
         ),
         prepare_batch=lambda spec_case, batch: _prepare_gdn_verify_batch(
             spec_case,
@@ -825,6 +856,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     cuda_graph_capture_batch_size: int = 2,
+    force_gpu_only_seq_lens: bool = False,
 ):
     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
@@ -862,15 +894,20 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     )
 
     num_draft_tokens = case.extend_lens[0] if case.extend_lens else 0
-    assert (
-        num_draft_tokens > 0
-    ), "DSV4 verify cases must set `extend_lens=(num_draft, ...)`."
+    assert num_draft_tokens > 0, (
+        "DSV4 verify cases must set `extend_lens=(num_draft, ...)`."
+    )
 
     def _prepare_dsv4_verify_batch(spec_case, batch):
         _prepare_target_verify_batch(batch, spec_case, device)
         batch.spec_info = _make_eagle_verify_input(
             spec_case, batch, topk=topk, device=device
         )
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            batch.spec_info.seq_lens_cpu = None
+            batch.spec_info.seq_lens_sum = None
 
     def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
         # Capture uses uniform prefixes per request; each request still
@@ -1009,8 +1046,8 @@ def run_kda_eagle_verify_cuda_graph_case(
         make_forward_batch=_make_kda_forward_batch,
         fixture_inputs=kda_fixture_inputs,
         make_capture_inputs=make_kda_random_inputs,
-        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: (
-            kda_fixture_inputs(fixture)
+        make_replay_inputs=lambda _case, fixture, *_args, **_kwargs: kda_fixture_inputs(
+            fixture
         ),
         prepare_batch=lambda spec_case, batch: _prepare_kda_verify_batch(
             spec_case,

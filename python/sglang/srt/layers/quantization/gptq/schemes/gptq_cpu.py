@@ -9,7 +9,6 @@ from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
     GPTQIntelAMXLinearKernel,
     GPTQIntelAMXMoEKernel,
 )
-from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -18,6 +17,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from sglang.srt.utils import set_weight_attrs
 
 from .gptq_linear import GPTQLinearScheme
 from .gptq_scheme import GPTQMoESchemeBase
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 __all__ = ["GPTQIntelAMXLinearScheme", "GPTQIntelAMXMoEScheme"]
 
 
-def _check_cpu_amx_support(quant_config: "GPTQConfig") -> None:
+def _check_cpu_amx_support(quant_config: GPTQConfig) -> None:
     if quant_config.desc_act and not (
         quant_config.true_sequential and quant_config.static_groups
     ):
@@ -46,7 +46,7 @@ def _check_cpu_amx_support(quant_config: "GPTQConfig") -> None:
 class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
     """Linear scheme for GPTQ on Intel CPU with AMX."""
 
-    def _init_kernel(self, quant_config: "GPTQConfig"):
+    def _init_kernel(self, quant_config: GPTQConfig):
         return GPTQIntelAMXLinearKernel(quant_config)
 
     def create_weights(
@@ -152,7 +152,7 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
 class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     """MoE scheme for GPTQ on Intel CPU with AMX."""
 
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
         self.kernel = GPTQIntelAMXMoEKernel(quant_config)
 
@@ -224,7 +224,6 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
-        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
 
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
@@ -249,7 +248,6 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
-        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(num_experts, hidden_size, dtype=torch.int32),
@@ -274,12 +272,15 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
     ):
         self.kernel.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ):
         return self.kernel.apply(layer, dispatch_output)

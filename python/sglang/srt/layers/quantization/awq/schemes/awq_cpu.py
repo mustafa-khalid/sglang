@@ -23,14 +23,14 @@ __all__ = ["AWQIntelAMXLinearScheme", "AWQIntelAMXMoEScheme"]
 class AWQIntelAMXLinearScheme(AWQLinearScheme):
     """Linear scheme for AWQ on Intel CPU with AMX."""
 
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         return AWQIntelAMXLinearKernel(quant_config)
 
 
 class AWQIntelAMXMoEScheme(AWQMoEScheme):
     """MoE scheme for AWQ on Intel CPU with AMX."""
 
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         return AWQIntelAMXMoEKernel(quant_config)
 
     def create_moe_runner(
@@ -38,3 +38,6 @@ class AWQIntelAMXMoEScheme(AWQMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         self.kernel.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return None

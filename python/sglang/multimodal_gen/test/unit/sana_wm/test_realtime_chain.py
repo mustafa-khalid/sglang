@@ -15,7 +15,6 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_chain import (
     SanaWMCameraCondStage,
     SanaWMNoiseState,
@@ -25,11 +24,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.realtime_stage import (
     SanaWMRealtimeStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
-    SanaWMStreamCacheState,
-)
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
-from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 
 MC = 8
 
@@ -37,23 +35,6 @@ MC = 8
 class _TestRealtimeStage(SanaWMRealtimeStage):
     def forward(self, batch, server_args):
         raise NotImplementedError
-
-
-@pytest.fixture
-def _global_args():
-    prev = _sa_mod._global_server_args
-    set_global_server_args(
-        SimpleNamespace(
-            comfyui_mode=False,
-            enable_cfg_parallel=False,
-            enable_torch_compile=False,
-            attention_backend=None,
-        )
-    )
-    try:
-        yield
-    finally:
-        set_global_server_args(prev)
 
 
 def _prep_stage():
@@ -153,7 +134,7 @@ def test_realtime_camera_conditioning_uses_requested_size():
     assert plucker.shape == (1, 48, 3, 15, 26)
 
 
-def test_latent_prep_plan_and_noise_discipline(_global_args):
+def test_latent_prep_plan_and_noise_discipline():
     stage = _prep_stage()
     session = RealtimeSession()
     fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
@@ -162,7 +143,7 @@ def test_latent_prep_plan_and_noise_discipline(_global_args):
     inputs.latent_t = 5  # fixed horizon: segments [0, 3, 5] for nfpb=2
     inputs.num_frame_per_block = 2
     inputs.sink_size = 1
-    cache = session.get_or_create_state(SanaWMStreamCacheState)
+    cache = get_realtime_causal_dit_state(session)
 
     # Tick 0: front-loaded chunk 0 (cond + remainder) + full-horizon buffer.
     batch = stage.forward(_batch(session, 0, fl), _server_args())
@@ -193,7 +174,7 @@ def test_latent_prep_plan_and_noise_discipline(_global_args):
     assert torch.isfinite(batch.latents).all()
 
 
-def test_latent_prep_open_ended_uniform_chunk0(_global_args):
+def test_latent_prep_open_ended_uniform_chunk0():
     stage = _prep_stage()
     session = RealtimeSession()
     fl = torch.ones(1, MC, 1, 2, 2, dtype=torch.float32)
@@ -202,7 +183,7 @@ def test_latent_prep_open_ended_uniform_chunk0(_global_args):
     inputs.latent_t = None  # open-ended
     inputs.num_frame_per_block = 3
     inputs.sink_size = 1
-    session.get_or_create_state(SanaWMStreamCacheState)
+    get_realtime_causal_dit_state(session)
 
     batch = stage.forward(_batch(session, 0, fl), _server_args())
     noise = session.get_or_create_state(SanaWMNoiseState)

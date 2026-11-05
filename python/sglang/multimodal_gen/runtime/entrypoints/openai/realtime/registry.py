@@ -4,21 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
-    RealtimeModelAdapter,
-)
-
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+        BaseRealtimeModelAdapter,
+    )
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-_REALTIME_ADAPTER_REGISTRY: dict[type, type[RealtimeModelAdapter]] = {}
+_REALTIME_ADAPTER_REGISTRY: dict[type, type[BaseRealtimeModelAdapter]] = {}
 _BUILTIN_ADAPTERS_REGISTERED = False
 
 
 def register_realtime_model_adapter(
     pipeline_config_cls: type,
-    adapter_cls: type[RealtimeModelAdapter],
+    adapter_cls: type[BaseRealtimeModelAdapter],
 ) -> None:
     _REALTIME_ADAPTER_REGISTRY[pipeline_config_cls] = adapter_cls
 
@@ -28,20 +27,34 @@ def _register_builtin_realtime_model_adapters() -> None:
     if _BUILTIN_ADAPTERS_REGISTERED:
         return
 
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
+        CosmosDreamsRealtimeConfig,
+    )
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
         LingBotWorldCausalDMDConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.nomas import NomasPipelineConfig
     from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
         SanaWMRealtimeConfig,
     )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.cosmos_dreams_realtime_adapter import (
+        CosmosDreamsRealtimeAdapter,
+    )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.nomas_realtime_adapter import (
+        NomasRealtimeAdapter,
     )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.sana_wm_realtime_adapter import (
         SanaWMRealtimeAdapter,
     )
 
     register_realtime_model_adapter(
+        CosmosDreamsRealtimeConfig,
+        CosmosDreamsRealtimeAdapter,
+    )
+    register_realtime_model_adapter(
         LingBotWorldCausalDMDConfig,
         LingBotWorldRealtimeAdapter,
     )
@@ -49,12 +62,13 @@ def _register_builtin_realtime_model_adapters() -> None:
         SanaWMRealtimeConfig,
         SanaWMRealtimeAdapter,
     )
+    register_realtime_model_adapter(NomasPipelineConfig, NomasRealtimeAdapter)
     _BUILTIN_ADAPTERS_REGISTERED = True
 
 
 def get_realtime_model_adapter(
     server_args: ServerArgs,
-) -> RealtimeModelAdapter:
+) -> BaseRealtimeModelAdapter:
     _register_builtin_realtime_model_adapters()
 
     pipeline_config = server_args.pipeline_config
@@ -66,4 +80,13 @@ def get_realtime_model_adapter(
     raise ValueError(
         "Realtime video is not supported for pipeline config "
         f"{type(pipeline_config).__name__}; no realtime adapter is registered."
+    )
+
+
+def has_realtime_model_adapter(server_args: ServerArgs) -> bool:
+    """Whether the resolved pipeline config has a registered adapter."""
+    _register_builtin_realtime_model_adapters()
+    return any(
+        config_cls in _REALTIME_ADAPTER_REGISTRY
+        for config_cls in type(server_args.pipeline_config).__mro__
     )

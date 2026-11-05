@@ -9,8 +9,8 @@ import unittest
 
 import requests
 
-from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
-from sglang.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
+from sglang.benchmark.one_batch_server import BenchArgs as OneBatchBenchArgs
+from sglang.benchmark.one_batch_server import run_benchmark as run_one_batch_benchmark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_BASE_ENV = {
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "0",
 }
 

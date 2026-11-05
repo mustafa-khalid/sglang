@@ -24,17 +24,31 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_token_to_kv_pool,
+)
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.utils import (
+    get_current_device_stream_fast,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    print_info_once,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -42,6 +56,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -55,7 +70,7 @@ class WeightsMapper:
     orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
     orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
 
-    def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
+    def __or__(self, other: WeightsMapper) -> WeightsMapper:
         return WeightsMapper(
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
@@ -154,9 +169,12 @@ class AutoWeightsLoader:
             for weight_name, weight_data in weights
         )
         for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
-            yield prefix, (
-                ("" if len(parts) == 1 else parts[1], weight_data)
-                for parts, weight_data in group
+            yield (
+                prefix,
+                (
+                    ("" if len(parts) == 1 else parts[1], weight_data)
+                    for parts, weight_data in group
+                ),
             )
 
     @staticmethod
@@ -284,13 +302,31 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    # The fused RoPE writer cannot localize DCP slots or filter token owners.
+    if get_parallel().dcp_enabled:
+        return False
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
-        and not isinstance(pool, SWAKVPool)
-        and not is_prefill_context_parallel_enabled()
-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
+        and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
+        and not is_cp_active(forward_batch)
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    ) or (
+        _is_hip
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+        and not _window_writes_translated(pool)
+    )
+
+
+def _window_writes_translated(pool) -> bool:
+    """Whether the pool's window layers write at ids of their own that only the
+    pool's write door derives (a unified pool's window view). The fused store
+    maps window slots through `full_to_swa_index_mapping`, which such a pool
+    does not have, so it would write window layers at the owner's ids."""
+    router = pool.layer_router
+    window = router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+    return window is not None and router.view(window.name).requires_physical_write_loc
 
 
 def create_fused_set_kv_buffer_arg(
@@ -298,15 +334,13 @@ def create_fused_set_kv_buffer_arg(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
 ):
-    from sglang.jit_kernel.rope import FusedSetKVBufferArg
-
     layer_id = layer.layer_id
     token_to_kv_pool = get_token_to_kv_pool()
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+    kv = get_kv_layers().read(layer_id)
+    k_buffer, v_buffer = kv.key(), kv.value()
 
     if not _is_hip:
+        # CUDA path.
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
         return FusedSetKVBufferArg(
             value=value,
@@ -315,10 +349,21 @@ def create_fused_set_kv_buffer_arg(
             cache_loc=forward_batch.out_cache_loc,
         )
     else:
+        # ROCm path.
         page_size = token_to_kv_pool.page_size
+        # A non-hybrid pool has no full->SWA remap: SWA and full layers
+        # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
+        # gives). Leaving swa_slot_mapping=None makes the fused store write at
+        # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
+        full_to_swa = (
+            token_to_kv_pool.full_to_swa_index_mapping
+            if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
+            else None
+        )
         slot_mapping_swa = (
-            token_to_kv_pool.full_to_swa_index_mapping.long()
-            if layer.sliding_window_size > 0
+            full_to_swa.long()
+            if layer.sliding_window_size > 0 and full_to_swa is not None
             else None
         )
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
@@ -329,11 +374,11 @@ def create_fused_set_kv_buffer_arg(
             key_cache = k_buffer
             value_cache = v_buffer
         else:
-            key_cache = k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            key_cache = paged_kv_view(
+                k_buffer, page_size, layer.tp_k_head_num, layer.qk_head_dim
             )
-            value_cache = v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            value_cache = paged_kv_view(
+                v_buffer, page_size, layer.tp_v_head_num, layer.v_head_dim
             )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -344,6 +389,84 @@ def create_fused_set_kv_buffer_arg(
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }
+
+
+def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
+
+    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
+    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
+    tuple. Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    """
+    if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
+        return
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    if not (
+        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
+        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+    ):
+        return
+    # The fused producer does not apply AWQ's per-input-channel scale.
+    if mlp.down_proj.quant_method.quant_config.is_awq:
+        return
+    # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
+    if get_fp4_gemm_runner_backend().is_marlin():
+        return
+    # The fused kernel never writes the scale padding, which exists when K % 64 != 0.
+    if mlp.down_proj.input_size_per_partition % 64 != 0:
+        return
+    try:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
+    except ImportError:
+        return
+    mlp._enable_silu_fp4_quant_fusion = True
+    mlp.down_proj._accepts_prequantized_fp4 = True
+    print_info_once("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
+
+
+def can_run_silu_fp4_quant_fusion(
+    mlp: torch.nn.Module, gate_up: torch.Tensor | tuple
+) -> bool:
+    """Whether this forward can hand down_proj the fused (fp4, scale) tuple."""
+    return (
+        mlp._enable_silu_fp4_quant_fusion
+        and not isinstance(gate_up, tuple)
+        and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
+        and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+    )
+
+
+def silu_and_mul_fp4_quant(
+    mlp: torch.nn.Module, gate_up: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SiLU(gate) * up of a dense MLP, quantized to NVFP4 for its down_proj."""
+    from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+    # input_scale_inv only exists after weight loading, so derive it lazily;
+    # the fused kernel requires a 1-D global scale.
+    if mlp._down_input_scale_inv_1d is None:
+        mlp._down_input_scale_inv_1d = mlp.down_proj.input_scale_inv.reshape(1)
+    num_tokens = gate_up.shape[0]
+    masked_m = mlp._masked_m_cache.get(num_tokens)
+    if masked_m is None:
+        masked_m = torch.tensor([num_tokens], dtype=torch.int32, device=gate_up.device)
+        mlp._masked_m_cache[num_tokens] = masked_m
+    y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+        gate_up.unsqueeze(0),
+        masked_m,
+        mlp._down_input_scale_inv_1d,
+    )
+    # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
+    # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
+    # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
+    # rounding ties for M in 64..8192).
+    y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
+    m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
+    y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
+    return y_fp4, y_sf
 
 
 def permute_inv(perm: torch.Tensor) -> torch.Tensor:
@@ -361,9 +484,9 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
     Returns:
         cu_seqlens: 1D int32 tensor on CPU, shape [N + 1]
     """
-    assert (
-        grid_thw.device.type == "cpu"
-    ), "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    assert grid_thw.device.type == "cpu", (
+        "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    )
     arr = grid_thw.numpy()
 
     cu_seqlens = np.repeat(arr[:, 1] * arr[:, 2], arr[:, 0]).cumsum(
@@ -375,7 +498,6 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryPosMixin:
-
     @staticmethod
     @lru_cache(maxsize=1024)
     def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
@@ -424,12 +546,37 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     inputs and fault on strided tensors (root cause of the #21734 revert
     in #23159).
     """
+
     if (
         _is_cuda
-        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
     return x.reshape(-1, head_dim)
+
+
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_cpu")
+
+
+def can_use_fused_qk_norm_cpu(
+    q: torch.Tensor, k: torch.Tensor, head_dim: int, q_eps: float, k_eps: float
+) -> bool:
+    return (
+        _is_cpu
+        and q_eps == k_eps
+        and q.dim() == 2
+        and k.dim() == 2
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        # q/k are usually strided views into qkv; only the head rows must be dense
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and q.size(-1) % head_dim == 0
+        and k.size(-1) % head_dim == 0
+        and _has_cpu_fused_qk_norm()
+    )
 
 
 def apply_qk_norm(
@@ -461,12 +608,19 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    if allow_inplace and can_use_fused_qk_norm_cpu(q, k, head_dim, q_eps, k_eps):
+        torch.ops.sgl_kernel.fused_qk_norm_cpu(
+            q, k, q_norm.weight, k_norm.weight, q_eps
+        )
+        return q, k
+
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        and get_global_server_args().piecewise_cuda_graph_compiler
+        and get_exec().graph.cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
@@ -571,6 +725,9 @@ def fused_qk_gemma_rmsnorm(
     q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
     k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
 
+    if _is_hip and q_rows == 0:
+        return q_out, k_out
+
     BLOCK_HD = triton.next_power_of_2(head_dim)
 
     _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
@@ -590,6 +747,130 @@ def fused_qk_gemma_rmsnorm(
     )
 
     return q_out, k_out
+
+
+# ---------------------------------------------------------------------------
+# Fused QK GemmaRMSNorm + gate extraction kernel
+# For models with attn_output_gate (e.g. Qwen3.5) where q and gate are
+# interleaved per head: [q_h0, gate_h0, q_h1, gate_h1, ...].
+# Reads q from the interleaved buffer, normalizes it, and copies gate to a
+# contiguous output — all in a single kernel launch.  Eliminates two
+# elementwise copy kernels that would otherwise be needed to deinterleave.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_qk_gemma_rmsnorm_gate_kernel(
+    QG_ptr,
+    K_ptr,
+    Q_out_ptr,
+    K_out_ptr,
+    Gate_out_ptr,
+    QW_ptr,
+    KW_ptr,
+    qg_token_stride,
+    qg_head_stride,
+    k_token_stride,
+    k_head_stride,
+    num_heads,
+    num_kv_heads,
+    k_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_HD)
+    mask = cols < HEAD_DIM
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+
+    token_idx = pid // num_heads
+    head_idx = pid % num_heads
+
+    base = token_idx * qg_token_stride + head_idx * qg_head_stride
+
+    # Q norm
+    q = tl.load(QG_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+    w_q = tl.load(QW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(q * q, axis=0) / HEAD_DIM
+    q_normed = (q * tl.rsqrt(q_var + EPS) * (w_q + 1.0)).to(out_dtype)
+    out_off = pid * HEAD_DIM + cols
+    tl.store(Q_out_ptr + out_off, q_normed, mask=mask)
+
+    # Gate copy
+    gate = tl.load(QG_ptr + base + HEAD_DIM + cols, mask=mask, other=0.0)
+    tl.store(Gate_out_ptr + out_off, gate, mask=mask)
+
+    # K norm (first k_rows blocks only)
+    if pid < k_rows:
+        token_idx_k = pid // num_kv_heads
+        head_idx_k = pid % num_kv_heads
+        k_off = token_idx_k * k_token_stride + head_idx_k * k_head_stride + cols
+        k = tl.load(K_ptr + k_off, mask=mask, other=0.0).to(tl.float32)
+        w_k = tl.load(KW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(k * k, axis=0) / HEAD_DIM
+        k_normed = (k * tl.rsqrt(k_var + EPS) * (w_k + 1.0)).to(out_dtype)
+        k_out_off = pid * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_out_off, k_normed, mask=mask)
+
+
+def fused_qk_gemma_rmsnorm_with_gate(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused QK GemmaRMSNorm + gate extraction from interleaved q_gate buffer.
+
+    q_gate: (seq, q_size*2) where q and gate are interleaved per head,
+            i.e. [q_h0, gate_h0, q_h1, gate_h1, ...] with q_size = num_heads * head_dim.
+            Can be a non-contiguous view from qkv.split().
+    k: (seq, kv_size) — same as fused_qk_gemma_rmsnorm.
+
+    Returns (q_out, k_out, gate_out) all contiguous with shape
+    (seq*num_heads, head_dim), (seq*num_kv_heads, head_dim), (seq*num_heads, head_dim).
+    """
+    seq_len = q_gate.shape[0]
+    qg_3d = q_gate.view(seq_len, num_heads, 2 * head_dim)
+    num_kv_heads = k.shape[-1] // head_dim
+    k_3d = k.view(seq_len, num_kv_heads, head_dim)
+
+    q_rows = seq_len * num_heads
+    k_rows = seq_len * num_kv_heads
+
+    q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+    k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+    gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    if _is_hip and q_rows == 0:
+        return q_out, k_out, gate_out
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    _fused_qk_gemma_rmsnorm_gate_kernel[(q_rows,)](
+        qg_3d,
+        k_3d,
+        q_out,
+        k_out,
+        gate_out,
+        q_weight,
+        k_weight,
+        qg_3d.stride(0),
+        qg_3d.stride(1),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        num_heads,
+        num_kv_heads,
+        k_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        EPS=eps,
+        FP16=(q_gate.dtype == torch.float16),
+    )
+
+    return q_out, k_out, gate_out
 
 
 # Register the inplace op

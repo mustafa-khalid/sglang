@@ -28,6 +28,29 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def verify_latent_preparation_inputs(batch: Req) -> VerificationResult:
+    """Input contract shared by generic and model-specific latent preparation."""
+    result = VerificationResult()
+    result.add_check(
+        "prompt_or_embeds",
+        None,
+        lambda _: (
+            V.string_or_list_strings(batch.prompt)
+            or V.list_not_empty(batch.prompt_embeds)
+        ),
+    )
+    result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
+    result.add_check(
+        "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
+    )
+    result.add_check("generator", batch.generator, V.generator_or_list_generators)
+    result.add_check("num_frames", batch.num_frames, V.positive_int)
+    result.add_check("height", batch.height, V.positive_int)
+    result.add_check("width", batch.width, V.positive_int)
+    result.add_check("latents", batch.latents, V.none_or_tensor)
+    return result
+
+
 @dataclass(frozen=True)
 class LatentPreparationFingerprint:
     height: int | None
@@ -40,7 +63,7 @@ class LatentPreparationFingerprint:
 
 @dataclass(frozen=True)
 class LatentPreparationSpec:
-    """ "dataclass for controlling the LatentPreparationStage runtime semantics"""
+    """Runtime configuration for LatentPreparationStage."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -141,18 +164,24 @@ class LatentPreparationStage(PipelineStage):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        # Generate or use provided latents
+        # Apply the same preparation to generated and unpacked provided latents.
+        spec = self.get_latent_preparation_spec(
+            batch, server_args, batch_size, latent_num_frames, device
+        )
         if latents is None:
-            spec = self.get_latent_preparation_spec(
-                batch, server_args, batch_size, latent_num_frames, device
-            )
             latents = randn_tensor(
                 spec.shape,
                 generator=generator,
                 device=spec.device,
                 dtype=spec.dtype,
             )
+            needs_preparation = True
+        else:
+            latents = latents.to(device)
+            # ComfyUI may provide already-packed [B, S, D] latents.
+            needs_preparation = tuple(latents.shape) == tuple(spec.shape)
 
+        if needs_preparation:
             latent_ids = (
                 server_args.pipeline_config.maybe_prepare_latent_ids(latents)
                 if spec.prepare_latent_ids
@@ -166,8 +195,6 @@ class LatentPreparationStage(PipelineStage):
                 latents = server_args.pipeline_config.maybe_pack_latents(
                     latents, batch_size, batch
                 )
-        else:
-            latents = latents.to(device)
 
         # Scale the initial noise if needed
         if self.should_scale_initial_noise(batch, server_args) and hasattr(
@@ -342,31 +369,13 @@ class LatentPreparationStage(PipelineStage):
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )
         if use_temporal_scaling_frames:
-            temporal_scale_factor = (
-                server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
+            temporal_scale_factor = server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
         return int(latent_num_frames)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage inputs."""
-        result = VerificationResult()
-        result.add_check(
-            "prompt_or_embeds",
-            None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
-        )
-        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
-        result.add_check(
-            "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
-        )
-        result.add_check("generator", batch.generator, V.generator_or_list_generators)
-        result.add_check("num_frames", batch.num_frames, V.positive_int)
-        result.add_check("height", batch.height, V.positive_int)
-        result.add_check("width", batch.width, V.positive_int)
-        result.add_check("latents", batch.latents, V.none_or_tensor)
-        return result
+        return verify_latent_preparation_inputs(batch)
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage outputs."""
@@ -376,60 +385,4 @@ class LatentPreparationStage(PipelineStage):
         # disable temporarily for image-generation models
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("raw_latent_shape", batch.raw_latent_shape, V.is_tuple)
-        return result
-
-
-class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
-    """Prepare one realtime causal DiT chunk from the encoded condition shape."""
-
-    def get_forward_latent_num_frames(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> int:
-        return int(
-            batch.realtime_chunk_size
-            or self.transformer.config.arch_config.num_frames_per_block
-        )
-
-    def get_latent_preparation_spec(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-        batch_size: int,
-        num_frames: int,
-        device: torch.device | str,
-    ) -> LatentPreparationSpec:
-        condition_latent = batch.image_latent
-        assert condition_latent is not None, (
-            "Realtime chunk latent preparation requires image_latent. "
-            "Ensure the condition VAE encoding stage runs before this stage."
-        )
-        return LatentPreparationSpec(
-            shape=(
-                condition_latent.shape[0],
-                self.transformer.config.arch_config.out_channels,
-                num_frames,
-                condition_latent.shape[3],
-                condition_latent.shape[4],
-            ),
-            dtype=condition_latent.dtype,
-            device=device,
-            prepare_latent_ids=False,
-            pack_latents=False,
-        )
-
-    def should_scale_initial_noise(self, batch: Req, server_args: ServerArgs) -> bool:
-        return False
-
-    def requires_batch_height_width(self, batch: Req, server_args: ServerArgs) -> bool:
-        return False
-
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check(
-            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
-        )
-        result.add_check("generator", batch.generator, V.generator_or_list_generators)
-        result.add_check("latents", batch.latents, V.none_or_tensor)
         return result
